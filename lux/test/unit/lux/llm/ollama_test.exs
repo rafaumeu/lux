@@ -58,6 +58,16 @@ defmodule Lux.LLM.OllamaTest do
               ]} = Models.list("http://localhost:11434")
     end
 
+    test "list/0 with no explicit endpoint uses default_endpoint/0" do
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "GET"
+        # default_endpoint returns "http://localhost:11434" from app config
+        Req.Test.json(conn, %{"models" => []})
+      end)
+
+      assert {:ok, []} = Models.list()
+    end
+
     test "pull/2 downloads a model" do
       Req.Test.expect(Ollama, fn conn ->
         assert conn.method == "POST"
@@ -124,6 +134,60 @@ defmodule Lux.LLM.OllamaTest do
       end)
 
       assert :ok = Models.running?("http://localhost:11434")
+    end
+
+    test "running?/0 with no explicit endpoint uses default_endpoint/0" do
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "GET"
+        Req.Test.json(conn, %{"status" => "ok"})
+      end)
+
+      assert :ok = Models.running?()
+    end
+
+    test "running?/1 returns error when not running" do
+      Req.Test.expect(Ollama, fn conn ->
+        conn
+        |> Plug.Conn.send_resp(503, Jason.encode!(%{"error" => "not running"}))
+      end)
+
+      assert {:error, {:not_running, 503}} = Models.running?("http://localhost:11434")
+    end
+
+    describe "default_endpoint/0" do
+      test "returns configured endpoint when valid string" do
+        original = Application.get_env(:lux, :ollama_endpoint)
+        Application.put_env(:lux, :ollama_endpoint, "http://my-server:11434")
+
+        try do
+          assert "http://my-server:11434" = Models.default_endpoint()
+        after
+          Application.put_env(:lux, :ollama_endpoint, original)
+        end
+      end
+
+      test "falls back to default when endpoint is nil" do
+        original = Application.get_env(:lux, :ollama_endpoint)
+        Application.delete_env(:lux, :ollama_endpoint)
+
+        try do
+          assert "http://localhost:11434" = Models.default_endpoint()
+        after
+          Application.put_env(:lux, :ollama_endpoint, original)
+        end
+      end
+
+      test "falls back to default when endpoint is misconfigured (non-string)" do
+        original = Application.get_env(:lux, :ollama_endpoint)
+        # Simulate keyword-list misconfiguration
+        Application.put_env(:lux, :ollama_endpoint, default: "http://localhost:11434")
+
+        try do
+          assert "http://localhost:11434" = Models.default_endpoint()
+        after
+          Application.put_env(:lux, :ollama_endpoint, original)
+        end
+      end
     end
   end
 
@@ -265,7 +329,7 @@ defmodule Lux.LLM.OllamaTest do
         assert is_float(options["repeat_penalty"])
         assert is_integer(options["num_ctx"])
 
-        # Ollama format: top-level message
+        # Ollama format: top-level message with JSON content
         Req.Test.json(conn, %{
           "model" => "llama3.2",
           "message" => %{
@@ -296,6 +360,39 @@ defmodule Lux.LLM.OllamaTest do
                   }
                 }
               }} = Ollama.call("test prompt", [beam], config)
+    end
+
+    test "handles plain text response (FIX-2: no format: json)" do
+      config = %{
+        api_key: nil,
+        model: "llama3.2"
+      }
+
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/api/chat"
+
+        # Ollama returns plain text string in content when format is nil
+        Req.Test.json(conn, %{
+          "model" => "llama3.2",
+          "message" => %{
+            "role" => "assistant",
+            "content" => "This is a plain text response from the model.",
+            "done" => true
+          },
+          "done" => true,
+          "prompt_eval_count" => 10,
+          "eval_count" => 25
+        })
+      end)
+
+      assert {:ok,
+              %Signal{
+                payload: %{
+                  content: %{"text" => "This is a plain text response from the model."},
+                  finish_reason: "stop"
+                }
+              }} = Ollama.call("test prompt", [], config)
     end
 
     test "handles tool call responses with successful tool call (prism)" do
@@ -337,6 +434,40 @@ defmodule Lux.LLM.OllamaTest do
                       }
                     }
                   ],
+                  tool_calls_results: [%{result: "success test"}]
+                }
+              }} = Ollama.call("test prompt", [TestPrism], config)
+    end
+
+    test "handles tool call with map arguments (FIX-3: already decoded)" do
+      config = %{
+        api_key: nil,
+        model: "llama3.2"
+      }
+
+      Req.Test.expect(Ollama, fn conn ->
+        # Ollama may return arguments as a map instead of JSON string
+        Req.Test.json(conn, %{
+          "model" => "llama3.2",
+          "message" => %{
+            "role" => "assistant",
+            "tool_calls" => [
+              %{
+                "function" => %{
+                  "name" => "Lux_LLM_OllamaTest_TestPrism",
+                  "arguments" => %{"value" => "success"}
+                }
+              }
+            ],
+            "done" => true
+          },
+          "done" => true
+        })
+      end)
+
+      assert {:ok,
+              %Signal{
+                payload: %{
                   tool_calls_results: [%{result: "success test"}]
                 }
               }} = Ollama.call("test prompt", [TestPrism], config)
@@ -494,6 +625,181 @@ defmodule Lux.LLM.OllamaTest do
       end)
 
       assert {:ok, _} = Ollama.call("test prompt", [], config)
+    end
+
+    test "handles nil content in response" do
+      config = %{
+        api_key: nil,
+        model: "llama3.2"
+      }
+
+      Req.Test.expect(Ollama, fn conn ->
+        Req.Test.json(conn, %{
+          "model" => "llama3.2",
+          "message" => %{
+            "role" => "assistant",
+            "content" => nil,
+            "done" => true
+          },
+          "done" => true
+        })
+      end)
+
+      assert {:ok,
+              %Signal{
+                payload: %{content: nil}
+              }} = Ollama.call("test prompt", [], config)
+    end
+
+    test "handles OpenAI-compatible proxy format" do
+      config = %{
+        api_key: nil,
+        model: "llama3.2"
+      }
+
+      Req.Test.expect(Ollama, fn conn ->
+        Req.Test.json(conn, %{
+          "id" => "chatcmpl-123",
+          "object" => "chat.completion",
+          "created" => 1_700_000_000,
+          "model" => "llama3.2",
+          "choices" => [
+            %{
+              "index" => 0,
+              "message" => %{
+                "role" => "assistant",
+                "content" => "Plain text proxy response"
+              },
+              "finish_reason" => "stop"
+            }
+          ],
+          "usage" => %{
+            "prompt_tokens" => 10,
+            "completion_tokens" => 20,
+            "total_tokens" => 30
+          }
+        })
+      end)
+
+      assert {:ok,
+              %Signal{
+                payload: %{
+                  content: %{"text" => "Plain text proxy response"},
+                  finish_reason: "stop"
+                },
+                metadata: %{
+                  id: "chatcmpl-123",
+                  usage: %{
+                    "prompt_tokens" => 10,
+                    "completion_tokens" => 20,
+                    "total_tokens" => 30
+                  }
+                }
+              }} = Ollama.call("test prompt", [], config)
+    end
+  end
+
+  describe "embed/2" do
+    test "generates embedding for a single input" do
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/api/embed"
+
+        {:ok, body, _conn} = Plug.Conn.read_body(conn)
+        decoded = Jason.decode!(body)
+        assert decoded["model"] == "nomic-embed-text"
+        assert decoded["input"] == "Hello world"
+        assert decoded["stream"] == false
+
+        Req.Test.json(conn, %{
+          "model" => "nomic-embed-text",
+          "embeddings" => [
+            [0.1, 0.2, 0.3, 0.4, 0.5]
+          ],
+          "prompt_eval_count" => 5
+        })
+      end)
+
+      assert {:ok, %{"embeddings" => [[0.1, 0.2, 0.3, 0.4, 0.5]]}} =
+               Ollama.embed("Hello world",
+                 model: "nomic-embed-text",
+                 endpoint: "http://localhost:11434"
+               )
+    end
+
+    test "generates embeddings for batch inputs" do
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "POST"
+        assert conn.request_path == "/api/embed"
+
+        {:ok, body, _conn} = Plug.Conn.read_body(conn)
+        decoded = Jason.decode!(body)
+        assert decoded["input"] == ["Hello", "World"]
+
+        Req.Test.json(conn, %{
+          "model" => "nomic-embed-text",
+          "embeddings" => [
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6]
+          ]
+        })
+      end)
+
+      assert {:ok, %{"embeddings" => [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]}} =
+               Ollama.embed(["Hello", "World"],
+                 model: "nomic-embed-text",
+                 endpoint: "http://localhost:11434"
+               )
+    end
+
+    test "handles embedding API errors" do
+      Req.Test.expect(Ollama, fn conn ->
+        conn
+        |> Plug.Conn.send_resp(500, Jason.encode!(%{"error" => "model not found"}))
+      end)
+
+      assert {:error, {:http_error, 500, _body}} =
+               Ollama.embed("test", model: "nonexistent", endpoint: "http://localhost:11434")
+    end
+
+    test "uses config endpoint when endpoint option not provided" do
+      Req.Test.expect(Ollama, fn conn ->
+        assert conn.method == "POST"
+        # The embed function strips /api/chat from the config endpoint
+        # Config default is http://localhost:11434/api/chat → http://localhost:11434
+        Req.Test.json(conn, %{
+          "model" => "llama3.2",
+          "embeddings" => [[0.1, 0.2]]
+        })
+      end)
+
+      assert {:ok, %{"embeddings" => [[0.1, 0.2]]}} =
+               Ollama.embed("test", model: "llama3.2")
+    end
+  end
+
+  describe "parse_content/1" do
+    test "parses JSON content" do
+      assert {:ok, %{"key" => "value"}} = Ollama.parse_content(~s({"key": "value"}))
+    end
+
+    test "wraps plain text in a map (FIX-2: no crash on non-JSON)" do
+      assert {:ok, %{"text" => "Hello world"}} = Ollama.parse_content("Hello world")
+    end
+
+    test "handles nil content" do
+      assert {:ok, nil} = Ollama.parse_content(nil)
+    end
+
+    test "handles empty string" do
+      assert {:ok, %{"text" => ""}} = Ollama.parse_content("")
+    end
+
+    test "parses complex nested JSON" do
+      json = ~s({"items": [{"name": "a"}, {"name": "b"}], "count": 2})
+
+      assert {:ok, %{"items" => [%{"name" => "a"}, %{"name" => "b"}], "count" => 2}} =
+               Ollama.parse_content(json)
     end
   end
 end

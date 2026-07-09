@@ -2,6 +2,50 @@ defmodule Lux.LLM.Ollama do
   @moduledoc """
   Ollama LLM implementation that supports passing Beams, Prisms, and Lenses as tools.
   Enables self-hosted LLM capabilities with local model management.
+
+  ## Quick Start
+
+      # Chat with a local model (requires Ollama running)
+      {:ok, signal} = Lux.LLM.Ollama.call("Explain Elixir in one sentence", [], model: "llama3.2")
+
+      # With structured JSON output
+      {:ok, signal} = Lux.LLM.Ollama.call("List 3 colors", [], model: "llama3.2", format: "json")
+
+      # With tool use
+      {:ok, signal} = Lux.LLM.Ollama.call("What is the weather?", [WeatherLens], model: "llama3.2")
+
+  ## Configuration
+
+  All config can be set via application env:
+
+      config :lux, :ollama_models, default: "llama3.2"
+      config :lux, :ollama_endpoint, "http://localhost:11434"
+
+  Or per-call via the config map:
+
+      Lux.LLM.Ollama.call("prompt", [], model: "mistral:7b", temperature: 0.5)
+
+  ## Model Management
+
+      # Check if Ollama is running
+      :ok = Lux.LLM.Ollama.Models.running?()
+
+      # List available models
+      {:ok, models} = Lux.LLM.Ollama.Models.list()
+
+      # Pull a model
+      {:ok, _} = Lux.LLM.Ollama.Models.pull("llama3.2")
+
+      # Delete a model
+      :ok = Lux.LLM.Ollama.Models.delete("mistral:7b")
+
+  ## Embeddings
+
+      # Generate embeddings for text
+      {:ok, %{embeddings: [0.1, 0.2, ...]}} = Lux.LLM.Ollama.embed("Hello world", model: "llama3.2")
+
+      # Batch embeddings
+      {:ok, %{embeddings: [[0.1, ...], [0.2, ...]]}} = Lux.LLM.Ollama.embed(["Hello", "World"], model: "llama3.2")
   """
 
   @behaviour Lux.LLM
@@ -14,11 +58,6 @@ defmodule Lux.LLM.Ollama do
   require Beam
   require Lens
   require Logger
-
-  @doc """
-  Default Ollama endpoint. Can be overridden via Config or application env.
-  """
-  @endpoint "http://localhost:11434/api/chat"
 
   defmodule Config do
     @moduledoc """
@@ -95,6 +134,9 @@ defmodule Lux.LLM.Ollama do
     @doc """
     List locally available models.
     Returns `{:ok, [map()]}` with model details or `{:error, reason}`.
+
+    Uses `default_endpoint/0` which reads `:ollama_endpoint` from application env,
+    falling back to `"http://localhost:11434"`.
     """
     @spec list(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
     def list(endpoint \\ default_endpoint(), opts \\ []) do
@@ -196,6 +238,9 @@ defmodule Lux.LLM.Ollama do
     @doc """
     Check if the Ollama server is running and accessible.
     Returns `:ok` or `{:error, reason}`.
+
+    Uses `default_endpoint/0` which reads `:ollama_endpoint` from application env,
+    falling back to `"http://localhost:11434"`.
     """
     @spec running?(String.t(), keyword()) :: :ok | {:error, term()}
     def running?(endpoint \\ default_endpoint(), opts \\ []) do
@@ -214,8 +259,28 @@ defmodule Lux.LLM.Ollama do
       end
     end
 
-    defp default_endpoint do
-      Application.get_env(:lux, :ollama_endpoint, "http://localhost:11434")
+    @doc """
+    Returns the configured Ollama endpoint from application env.
+    Falls back to `"http://localhost:11434"` if not set.
+
+    The endpoint must be a plain string. Invalid values (e.g. keyword lists)
+    are caught and logged, falling back to the default.
+    """
+    @spec default_endpoint() :: String.t()
+    def default_endpoint do
+      endpoint = Application.get_env(:lux, :ollama_endpoint, "http://localhost:11434")
+
+      case endpoint do
+        value when is_binary(value) ->
+          value
+
+        _invalid ->
+          Logger.warning(
+            "Invalid :ollama_endpoint config (expected string, got #{inspect(endpoint)}), using default"
+          )
+
+          "http://localhost:11434"
+      end
     end
 
     defp maybe_auth_headers(nil), do: []
@@ -280,6 +345,59 @@ defmodule Lux.LLM.Ollama do
 
       {:error, error} ->
         handle_error(error)
+    end
+  end
+
+  @doc """
+  Generate embeddings for one or more inputs using Ollama's `/api/embed` endpoint.
+
+  ## Parameters
+
+    * `input` - A string or list of strings to embed
+    * `opts` - Keyword options, supports all `Config` fields plus:
+      * `:endpoint` - Override the Ollama endpoint (default: from app config)
+
+  ## Examples
+
+      {:ok, %{embeddings: [[0.1, 0.2, ...]]}} = Lux.LLM.Ollama.embed("Hello world", model: "llama3.2")
+      {:ok, %{embeddings: [[0.1, ...], [0.2, ...]]}} = Lux.LLM.Ollama.embed(["Hello", "World"], model: "nomic-embed-text")
+  """
+  @spec embed(String.t() | [String.t()], keyword()) :: {:ok, map()} | {:error, term()}
+  def embed(input, opts \\ []) do
+    config = struct(Config, Map.take(opts, Config.__struct__() |> Map.keys()))
+
+    endpoint =
+      case opts[:endpoint] do
+        nil -> config.endpoint |> String.replace("/api/chat", "")
+        custom -> custom |> String.replace("/api/chat", "")
+      end
+
+    body =
+      %{
+        model: Lux.Config.resolve(config.model),
+        input: input,
+        stream: false
+      }
+      |> maybe_add_keep_alive(config)
+
+    req =
+      Req.new(
+        url: "#{endpoint}/api/embed",
+        json: body,
+        headers: build_headers(config.api_key),
+        receive_timeout: config.receive_timeout
+      )
+      |> Req.merge(Application.get_env(:lux, __MODULE__, []))
+
+    case Req.post(req) do
+      {:ok, %{status: 200, body: %{"embeddings" => _embeddings} = body}} ->
+        {:ok, body}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:http_error, status, body}}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -375,7 +493,11 @@ defmodule Lux.LLM.Ollama do
     }
   end
 
-  def tool_to_function(%Prism{module_name: name, description: description, input_schema: input_schema}) do
+  def tool_to_function(%Prism{
+        module_name: name,
+        description: description,
+        input_schema: input_schema
+      }) do
     %{
       type: "function",
       function: %{
@@ -468,13 +590,24 @@ defmodule Lux.LLM.Ollama do
     end
   end
 
+  @doc """
+  Parse response content from the LLM.
+
+  Handles three cases:
+  1. JSON-encoded strings (when format: "json" is used)
+  2. Plain text strings (returns `{:ok, %{"text" => content}}`)
+  3. nil content (returns `{:ok, nil}`)
+  """
+  def parse_content(nil), do: {:ok, nil}
+
   def parse_content(content) when is_binary(content) do
     case Jason.decode(content) do
-      {:ok, structured_output} ->
-        {:ok, structured_output}
+      {:ok, decoded} ->
+        {:ok, decoded}
 
       {:error, _} ->
-        {:error, "failed to parse content: #{inspect(content)}"}
+        # Plain text response — Ollama returns raw strings when format is not set
+        {:ok, %{"text" => content}}
     end
   end
 
@@ -498,8 +631,21 @@ defmodule Lux.LLM.Ollama do
   def execute_tool_calls(nil), do: {:ok, nil}
 
   def execute_tool_call(%{"function" => %{"name" => tool_name, "arguments" => args}}) do
-    args = Jason.decode!(args)
-    execute_tool(tool_name, args, nil)
+    # Ollama may return arguments as a map (already decoded) or as a JSON string.
+    # Handle both cases to prevent Jason.decode! crash.
+    decoded_args =
+      case args do
+        args when is_binary(args) ->
+          Jason.decode!(args)
+
+        args when is_map(args) ->
+          args
+
+        other ->
+          raise "Unexpected tool call arguments type: #{inspect(other)}"
+      end
+
+    execute_tool(tool_name, decoded_args, nil)
   end
 
   def execute_tool(tool_name, args, ctx) when is_binary(tool_name) do
