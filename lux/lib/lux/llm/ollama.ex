@@ -364,7 +364,8 @@ defmodule Lux.LLM.Ollama do
   """
   @spec embed(String.t() | [String.t()], keyword()) :: {:ok, map()} | {:error, term()}
   def embed(input, opts \\ []) do
-    config = struct(Config, Map.take(opts, Config.__struct__() |> Map.keys()))
+    opts_map = if is_list(opts), do: Map.new(opts), else: opts
+    config = struct(Config, Map.take(opts_map, Config.__struct__() |> Map.keys()))
 
     endpoint =
       case opts[:endpoint] do
